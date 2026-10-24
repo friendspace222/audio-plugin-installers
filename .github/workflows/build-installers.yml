@@ -59,6 +59,16 @@ jobs:
           mkdir sources
           ditto -x -k audio-plugins-source.zip sources
           test -f "sources/$PRODUCT/CMakeLists.txt"
+          python3 - "sources/$PRODUCT/CMakeLists.txt" "$PRODUCT" <<'PY'
+          import os, pathlib, re, sys
+          source = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          pattern = r'^\s*project\s*\(\s*' + re.escape(sys.argv[2]) + r'\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)\s+LANGUAGES\b'
+          versions = re.findall(pattern, source, flags=re.MULTILINE | re.IGNORECASE)
+          assert len(versions) == 1, 'Expected one explicit project version in CMakeLists.txt'
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write('PLUGIN_VERSION=' + versions[0] + '\n')
+          print(sys.argv[2] + ' source version: ' + versions[0])
+          PY
           sw_vers
           xcodebuild -version
           xcrun --find clang++
@@ -74,8 +84,8 @@ jobs:
           # Existing CMake scripts fetch JUCE at the pinned 7.0.12 commit.
           # No Developer ID identities or notarization credentials are configured.
           bash scripts/build-macos.sh 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-build.log"
-          test -f "dist/$PRODUCT-0.1.0-macOS-Intel-Unsigned.pkg"
-          test -f "dist/$PRODUCT-0.1.0-macOS-Intel-Unsigned.dmg"
+          test -f "dist/$PRODUCT-$PLUGIN_VERSION-macOS-Intel-Unsigned.pkg"
+          test -f "dist/$PRODUCT-$PLUGIN_VERSION-macOS-Intel-Unsigned.dmg"
           for checksum in dist/*.sha256; do
             (cd dist && shasum -a 256 -c "$(basename "$checksum")")
           done
@@ -180,6 +190,19 @@ jobs:
           codesign --verify --strict --verbose=2 "$installed_app"
           test "$(stat -f %u "$installed_app/Contents/MacOS/$PRODUCT")" = 0
           test ! -e "$user_au"
+          python3 - "$PLUGIN_VERSION" "$receipt_prefix" "$installed_au" "$installed_vst3" "$installed_app" <<'PY'
+          import pathlib, plistlib, subprocess, sys
+          version, receipt_prefix = sys.argv[1:3]
+          for bundle in sys.argv[3:]:
+              with (pathlib.Path(bundle) / 'Contents/Info.plist').open('rb') as stream:
+                  info = plistlib.load(stream)
+              assert info['CFBundleShortVersionString'] == version, 'Installed bundle version mismatch: ' + bundle
+          for kind in ('au', 'vst3', 'app', 'docs'):
+              identifier = receipt_prefix + '.' + kind
+              receipt = plistlib.loads(subprocess.check_output(['pkgutil', '--pkg-info-plist', identifier]))
+              assert receipt['pkg-version'] == version, 'Installed receipt version mismatch: ' + identifier
+          print('All installed bundles and package receipts match source version ' + version)
+          PY
           # The Audio Unit is now discovered from the system installation created by installer.
           /usr/libexec/PlistBuddy -c 'Print :AudioComponents' "$installed_au/Contents/Info.plist" | tee "$RUNNER_TEMP/$PRODUCT-audio-components.log"
           ls -ld "$installed_au" "$installed_au/Contents" "$installed_au/Contents/MacOS" "$installed_au/Contents/MacOS/$PRODUCT" | tee -a "$RUNNER_TEMP/$PRODUCT-audio-components.log"
@@ -225,7 +248,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > dist/INSTALL-FIRST.txt <<EOF
-          $PRODUCT - COMPILED INTEL MAC INSTALLER
+          $PRODUCT $PLUGIN_VERSION - COMPILED INTEL MAC INSTALLER
 
           1. Quit Logic Pro or GarageBand.
           2. Double-click the .pkg file and follow Apple's Installer.
@@ -233,6 +256,10 @@ jobs:
           3. Choose Audio Unit for Logic Pro / GarageBand and enter your normal
              Mac administrator password when Apple's Installer requests it.
           4. Reopen your DAW and find $PRODUCT in its Audio Units menu.
+
+          After upgrading, load one of the included factory presets once to
+          hear the revised sounds. Saved DAW sessions retain their previously
+          saved parameter values; installing an update does not change them.
 
           No compilation, Terminal commands, CMake, or developer tools are needed
           on the destination Mac. The source archive accompanies the installer
@@ -249,12 +276,14 @@ jobs:
           EOF
           {
             echo "$PRODUCT native Mac build validation"
+            echo "Version: $PLUGIN_VERSION"
             echo "Commit: $GITHUB_SHA"
             echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             sw_vers
             echo "Passed: CTest, Mach-O architecture/deployment checks, native pkgbuild/productbuild,
           legacy gzip payloads, default and optional-app installation, installed destinations/receipts,
-          installed bundle signatures, and AU validation from the system-installed plugin,
+          installed bundle signatures and source-matched bundle/receipt versions,
+          AU validation from the system-installed plugin,
           DMG verification, and artifact checksums."
             echo "Not tested: Catalina 10.15.7 runtime, Logic/GarageBand runtime, listening quality."
             echo "Signing: ad-hoc code signatures; unsigned and unnotarized installer."
