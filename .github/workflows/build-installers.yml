@@ -1,0 +1,183 @@
+name: Build Intel Mac audio plugin installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - audio-plugins-source.zip
+      - .github/workflows/build-installers.yml
+
+permissions:
+  contents: read
+
+jobs:
+  mac-installers:
+    name: ${{ matrix.product }} Intel AU and installer
+    # The user authorized no costs: skip before allocating a runner in private repos.
+    if: github.event.repository.private == false
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - product: Tideglass
+            au_code: Tdgl
+            manufacturer: TdgA
+          - product: Ironvale
+            au_code: Irvl
+            manufacturer: IrvA
+    env:
+      PRODUCT: ${{ matrix.product }}
+      AU_CODE: ${{ matrix.au_code }}
+      AU_MANUFACTURER: ${{ matrix.manufacturer }}
+      # JUCE's separately configured juceaide must inherit the same target.
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      TIDEGLASS_ARCHITECTURES: x86_64
+      IRONVALE_ARCHITECTURES: x86_64
+      TIDEGLASS_MIN_MACOS: '10.15'
+      IRONVALE_MIN_MACOS: '10.15'
+      TIDEGLASS_JOBS: '4'
+      IRONVALE_JOBS: '4'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out build inputs
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract source archive
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          shasum -a 256 -c audio-plugins-source.zip.sha256
+          mkdir sources
+          ditto -x -k audio-plugins-source.zip sources
+          test -f "sources/$PRODUCT/CMakeLists.txt"
+          sw_vers
+          xcodebuild -version
+          xcrun --find clang++
+
+      - name: Check packaging control flow with simulated Apple tools
+        if: matrix.product == 'Tideglass'
+        run: python3 sources/Tideglass/tests/test_packaging.py
+
+      - name: Build, test, inspect binaries, and create native PKG and DMG
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          # Existing CMake scripts fetch JUCE at the pinned 7.0.12 commit.
+          # No Developer ID identities or notarization credentials are configured.
+          bash scripts/build-macos.sh 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-build.log"
+          test -f "dist/$PRODUCT-0.1.0-macOS-Intel-Unsigned.pkg"
+          test -f "dist/$PRODUCT-0.1.0-macOS-Intel-Unsigned.dmg"
+          for checksum in dist/*.sha256; do
+            (cd dist && shasum -a 256 -c "$(basename "$checksum")")
+          done
+
+      - name: Inspect the actual installer payload and validate its Audio Unit
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          package="$(cat dist/.latest-installer)"
+          case "$package" in "$GITHUB_WORKSPACE/sources/$PRODUCT/dist/"*.pkg) ;; *) exit 1 ;; esac
+          expanded="$RUNNER_TEMP/$PRODUCT-expanded-package"
+          pkgutil --expand-full "$package" "$expanded"
+          au="$expanded/au.pkg/Payload/Library/Audio/Plug-Ins/Components/$PRODUCT.component"
+          vst3="$expanded/vst3.pkg/Payload/Library/Audio/Plug-Ins/VST3/$PRODUCT.vst3"
+          app="$expanded/app.pkg/Payload/Applications/$PRODUCT.app"
+          support="$expanded/docs.pkg/Payload/Library/Application Support/$PRODUCT"
+          test -f "$support/LICENSE"
+          test -f "$support/THIRD_PARTY_NOTICES.md"
+          for bundle in "$au" "$vst3" "$app"; do
+            test -f "$bundle/Contents/MacOS/$PRODUCT"
+            test "$(lipo -archs "$bundle/Contents/MacOS/$PRODUCT")" = x86_64
+            codesign --verify --strict --verbose=2 "$bundle"
+          done
+          # AU validation uses the binary extracted from the final installer.
+          destination="$HOME/Library/Audio/Plug-Ins/Components/$PRODUCT.component"
+          if [[ -e "$destination" ]]; then
+            echo "Refusing to overwrite an existing Audio Unit: $destination" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$destination")"
+          cleanup() {
+            case "$destination" in
+              "$HOME/Library/Audio/Plug-Ins/Components/$PRODUCT.component") rm -rf -- "$destination" ;;
+            esac
+          }
+          trap cleanup EXIT
+          ditto "$au" "$destination"
+          killall -u "$(id -un)" AudioComponentRegistrar 2>/dev/null || true
+          auval -v aufx "$AU_CODE" "$AU_MANUFACTURER" 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-auval.log"
+          hdiutil verify "${package%.pkg}.dmg"
+
+      - name: Include installation instructions and validation record
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          cat > dist/INSTALL-FIRST.txt <<EOF
+          $PRODUCT - COMPILED INTEL MAC INSTALLER
+
+          1. Quit Logic Pro or GarageBand.
+          2. Double-click the .pkg file and follow Apple's Installer.
+             Alternatively, open the .dmg and double-click Install $PRODUCT.pkg.
+          3. Choose Audio Unit for Logic Pro / GarageBand and enter your normal
+             Mac administrator password when Apple's Installer requests it.
+          4. Reopen your DAW and find $PRODUCT in its Audio Units menu.
+
+          No compilation, Terminal commands, CMake, or developer tools are needed
+          on the destination Mac. The source archive accompanies the installer
+          for the default GPLv3 distribution; it is not needed to install.
+
+          These installers are unsigned and not notarized. If Catalina blocks
+          opening a downloaded installer, its Security & Privacy preferences
+          may offer Open Anyway. Only approve a file you trust.
+
+          Build target: Intel x86_64, minimum macOS 10.15.
+          Runtime tests ran on GitHub's newer macOS 15 Intel runner.
+          Catalina 10.15.7 and your Logic/GarageBand version still need runtime
+          and listening validation; deployment metadata alone does not prove it.
+          EOF
+          {
+            echo "$PRODUCT native Mac build validation"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            sw_vers
+            echo "Passed: CTest, Mach-O architecture/deployment checks, native pkgbuild/productbuild,
+          expanded installer payload and bundle signatures, AU validation from packaged payload,
+          DMG verification, and artifact checksums."
+            echo "Not tested: Catalina 10.15.7 runtime, Logic/GarageBand runtime, listening quality."
+            echo "Signing: ad-hoc code signatures; unsigned and unnotarized installer."
+          } > dist/BUILD-VALIDATION.txt
+
+      - name: Upload finished installers and corresponding source
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.product }}-macOS-Intel-Installer
+          path: |
+            sources/${{ matrix.product }}/dist/*.pkg
+            sources/${{ matrix.product }}/dist/*.dmg
+            sources/${{ matrix.product }}/dist/*.sha256
+            sources/${{ matrix.product }}/dist/*Corresponding-Source.tar.gz
+            sources/${{ matrix.product }}/dist/INSTALL-FIRST.txt
+            sources/${{ matrix.product }}/dist/BUILD-VALIDATION.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Preserve diagnostic logs if a check fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.product }}-failed-build-diagnostics
+          path: |
+            ${{ runner.temp }}/${{ matrix.product }}-build.log
+            ${{ runner.temp }}/${{ matrix.product }}-auval.log
+            sources/${{ matrix.product }}/build/macos-x86_64/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 1
