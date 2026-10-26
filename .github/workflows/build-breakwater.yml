@@ -1,0 +1,383 @@
+name: Build Breakwater Intel Mac installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - breakwater-source.zip
+
+permissions:
+  contents: read
+
+jobs:
+  mac-installers:
+    name: ${{ matrix.product }} Intel AU and installer
+    # Standard public-repository runner only; private repositories do not allocate a runner.
+    if: github.event.repository.private == false
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - product: Breakwater
+            au_code: BkwD
+            manufacturer: BkwA
+    env:
+      PRODUCT: ${{ matrix.product }}
+      AU_CODE: ${{ matrix.au_code }}
+      AU_MANUFACTURER: ${{ matrix.manufacturer }}
+      # JUCE's separately configured juceaide must inherit the same target.
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      BREAKWATER_ARCHITECTURES: x86_64
+      BREAKWATER_MIN_MACOS: '10.15'
+      BREAKWATER_JOBS: '4'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out build inputs
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract source archive
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -d "$DEVELOPER_DIR"
+          shasum -a 256 -c breakwater-source.zip.sha256
+          mkdir sources
+          ditto -x -k breakwater-source.zip sources
+          test -f "sources/$PRODUCT/CMakeLists.txt"
+          python3 - "sources/$PRODUCT/CMakeLists.txt" "$PRODUCT" <<'PY'
+          import os, pathlib, re, sys
+          source = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          pattern = r'^\s*project\s*\(\s*' + re.escape(sys.argv[2]) + r'\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)\s+LANGUAGES\b'
+          versions = re.findall(pattern, source, flags=re.MULTILINE | re.IGNORECASE)
+          assert len(versions) == 1, 'Expected one explicit project version in CMakeLists.txt'
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write('PLUGIN_VERSION=' + versions[0] + '\n')
+          print(sys.argv[2] + ' source version: ' + versions[0])
+          PY
+          sw_vers
+          xcodebuild -version
+          xcrun --find clang++
+
+      - name: Verify the recorded starter kit and prepare installed-resource checks
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/verify-breakwater-kit.py" <<'PY'
+          import hashlib, json, pathlib, sys, tarfile
+          reference = pathlib.Path(sys.argv[1])
+          version = sys.argv[2]
+          pieces = ('kick', 'snare', 'hat_closed', 'hat_open', 'tom_high', 'tom_low', 'crash', 'ride')
+          wav_names = {f'{piece}_v{layer}_r1.wav' for piece in pieces for layer in (1, 2, 3)}
+          attribution = {'manifest.json', 'PROVENANCE.txt', 'AVL-Drumkits-license.txt', 'CC-BY-SA-3.0-legalcode.txt'}
+          expected = wav_names | attribution
+          actual = {path.relative_to(reference).as_posix() for path in reference.rglob('*') if path.is_file()}
+          assert actual == expected, 'Source kit must contain exactly 24 WAVs and all four attribution/manifest files'
+          manifest = json.loads((reference / 'manifest.json').read_text(encoding='utf-8'))
+          assert len(manifest['samples']) == 24, 'Expected 24 manifest entries'
+          assert {item['file'] for item in manifest['samples']} == wav_names, 'Manifest does not cover the complete kit'
+          assert manifest['source_creator'] == 'Glen MacArthur', 'Missing sample creator attribution'
+          assert manifest['true_velocity_layers_per_piece'] == 3
+          assert manifest['true_round_robins_per_layer'] == 1
+          for item in manifest['samples']:
+              data = (reference / item['file']).read_bytes()
+              assert len(data) == item['bytes'], 'Source sample size mismatch: ' + item['file']
+              assert hashlib.sha256(data).hexdigest() == item['sha256'], 'Source sample checksum mismatch: ' + item['file']
+          for name in attribution:
+              assert (reference / name).stat().st_size > 0, 'Empty attribution: ' + name
+          hashes = {name: hashlib.sha256((reference / name).read_bytes()).digest() for name in expected}
+          print('Source kit verified: 24 recorded WAVs and all attribution/manifest files.')
+          for argument in sys.argv[3:]:
+              target = pathlib.Path(argument)
+              if target.is_dir():
+                  actual = {path.relative_to(target).as_posix() for path in target.rglob('*') if path.is_file()}
+                  assert actual == expected, 'Bundled kit contents mismatch: ' + str(target)
+                  for name in expected:
+                      assert hashlib.sha256((target / name).read_bytes()).digest() == hashes[name], 'Bundled kit file mismatch: ' + str(target / name)
+              else:
+                  root = 'Breakwater-' + version + '-Source/'
+                  with tarfile.open(target, 'r:gz') as archive:
+                      regular = {item.name for item in archive.getmembers() if item.isfile()}
+                      for required in ('CMakeLists.txt', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+                                       'Source/PluginProcessor.cpp', 'Source/KitSampler.cpp', 'Source/DrummerCore.cpp',
+                                       'tests/core_tests.cpp', 'tests/plugin_tests.cpp', 'scripts/build-macos.sh',
+                                       'scripts/package-macos.sh', 'docs/BUILD.md', 'docs/USER-GUIDE.md',
+                                       'docs/STARTER-KIT-PROVENANCE.txt', 'docs/licenses/GPL-3.0.txt',
+                                       'docs/licenses/AVL-Drumkits-license.txt', 'docs/licenses/CC-BY-SA-3.0-legalcode.txt',
+                                       'docs/licenses/AVL-Drumkits-CC-BY-SA-License.pdf',
+                                       'vendor/JUCE/LICENSE.md', 'vendor/JUCE/CMakeLists.txt'):
+                          assert root + required in regular, 'Incomplete corresponding source: ' + required
+                      prefix = root + 'Resources/Kit/'
+                      actual = {name[len(prefix):] for name in regular if name.startswith(prefix)}
+                      assert actual == expected, 'Corresponding-source kit contents mismatch'
+                      for name in expected:
+                          data = archive.extractfile(prefix + name).read()
+                          assert hashlib.sha256(data).digest() == hashes[name], 'Corresponding-source kit checksum mismatch: ' + name
+              print('Verified complete kit and attribution: ' + str(target))
+          PY
+          python3 "$RUNNER_TEMP/verify-breakwater-kit.py" "sources/$PRODUCT/Resources/Kit" "$PLUGIN_VERSION" | tee "$RUNNER_TEMP/$PRODUCT-kit-verification.log"
+
+      - name: Build, test, inspect binaries, and create native PKG and DMG
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          # Existing CMake scripts fetch JUCE at the pinned 7.0.12 commit.
+          # No Developer ID identities or notarization credentials are configured.
+          bash scripts/build-macos.sh 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-build.log"
+          test -f "dist/$PRODUCT-$PLUGIN_VERSION-macOS-Intel-Unsigned.pkg"
+          test -f "dist/$PRODUCT-$PLUGIN_VERSION-macOS-Intel-Unsigned.dmg"
+          for checksum in dist/*.sha256; do
+            (cd dist && shasum -a 256 -c "$(basename "$checksum")")
+          done
+          # CMake copies the independent Resources/Kit assets into every format.
+          artifacts="build/macos-x86_64/${PRODUCT}_artefacts/Release"
+          python3 "$RUNNER_TEMP/verify-breakwater-kit.py" Resources/Kit "$PLUGIN_VERSION" \
+            "$artifacts/AU/$PRODUCT.component/Contents/Resources/Kit" \
+            "$artifacts/VST3/$PRODUCT.vst3/Contents/Resources/Kit" \
+            "$artifacts/Standalone/$PRODUCT.app/Contents/Resources/Kit" \
+            "dist/$PRODUCT-$PLUGIN_VERSION-macOS-Intel-Corresponding-Source.tar.gz" | tee -a "$RUNNER_TEMP/$PRODUCT-kit-verification.log"
+
+      - name: Inspect and execute the installer, then validate the installed Audio Unit
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          package="$(cat dist/.latest-installer)"
+          case "$package" in "$GITHUB_WORKSPACE/sources/$PRODUCT/dist/"*.pkg) ;; *) exit 1 ;; esac
+          expanded="$RUNNER_TEMP/$PRODUCT-expanded-package"
+          pkgutil --expand-full "$package" "$expanded"
+          au="$expanded/au.pkg/Payload/Library/Audio/Plug-Ins/Components/$PRODUCT.component"
+          vst3="$expanded/vst3.pkg/Payload/Library/Audio/Plug-Ins/VST3/$PRODUCT.vst3"
+          app="$expanded/app.pkg/Payload/Applications/$PRODUCT.app"
+          support="$expanded/docs.pkg/Payload/Library/Application Support/$PRODUCT"
+          test -f "$support/LICENSE"
+          test -f "$support/THIRD_PARTY_NOTICES.md"
+          for bundle in "$au" "$vst3" "$app"; do
+            test -f "$bundle/Contents/MacOS/$PRODUCT"
+            test "$(lipo -archs "$bundle/Contents/MacOS/$PRODUCT")" = x86_64
+            codesign --verify --strict --verbose=2 "$bundle"
+          done
+          # Verify actual payload encoding, not just a successful build on a newer Mac.
+          raw="$RUNNER_TEMP/$PRODUCT-compressed-package"
+          pkgutil --expand "$package" "$raw"
+          python3 - "$raw" <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          payloads = sorted(root.rglob('Payload'))
+          assert len(payloads) == 4, 'Expected AU, VST3, app, and docs payloads'
+          for payload in payloads:
+              with payload.open('rb') as stream:
+                  assert stream.read(2) == b'\x1f\x8b', 'Expected Catalina-compatible legacy gzip payload: ' + str(payload)
+          print('All four installer payloads use legacy gzip compression.')
+          PY
+          test "$PRODUCT" = Breakwater
+          receipt_prefix=audio.breakwater.plugin
+          installed_au="/Library/Audio/Plug-Ins/Components/$PRODUCT.component"
+          installed_vst3="/Library/Audio/Plug-Ins/VST3/$PRODUCT.vst3"
+          installed_app="/Applications/$PRODUCT.app"
+          installed_docs="/Library/Application Support/$PRODUCT"
+          user_au="$HOME/Library/Audio/Plug-Ins/Components/$PRODUCT.component"
+          for existing in "$installed_au" "$installed_vst3" "$installed_app" "$installed_docs" "$user_au"; do
+            if [[ -e "$existing" ]]; then
+              echo "Refusing to overwrite a pre-existing installation: $existing" >&2
+              exit 1
+            fi
+          done
+          for kind in au vst3 app docs; do
+            if pkgutil --pkg-info "$receipt_prefix.$kind" >/dev/null 2>&1; then
+              echo "Expected a clean runner without $receipt_prefix.$kind receipt" >&2
+              exit 1
+            fi
+          done
+          # These system writes occur only inside the disposable GitHub-hosted Mac VM.
+          # First exercise exactly the defaults presented to the user by Installer.app.
+          /usr/sbin/installer -pkg "$package" -target / -showChoiceChangesXML > "$RUNNER_TEMP/$PRODUCT-default-choices.plist"
+          sudo /usr/sbin/installer -pkg "$package" -target / -verboseR -dumplog 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-install-default.log"
+          test -x "$installed_au/Contents/MacOS/$PRODUCT"
+          test -x "$installed_vst3/Contents/MacOS/$PRODUCT"
+          test -f "$installed_docs/LICENSE"
+          test -f "$installed_docs/THIRD_PARTY_NOTICES.md"
+          test -f "$installed_docs/docs/USER-GUIDE.md"
+          test ! -e "$installed_app"
+          for kind in au vst3 docs; do
+            pkgutil --pkg-info "$receipt_prefix.$kind"
+          done
+          if pkgutil --pkg-info "$receipt_prefix.app" >/dev/null 2>&1; then
+            echo "Default installation unexpectedly selected the optional app" >&2
+            exit 1
+          fi
+          cmp "$au/Contents/MacOS/$PRODUCT" "$installed_au/Contents/MacOS/$PRODUCT"
+          cmp "$vst3/Contents/MacOS/$PRODUCT" "$installed_vst3/Contents/MacOS/$PRODUCT"
+          cmp "$support/LICENSE" "$installed_docs/LICENSE"
+          for bundle in "$installed_au" "$installed_vst3"; do
+            codesign --verify --strict --verbose=2 "$bundle"
+            test "$(stat -f %u "$bundle/Contents/MacOS/$PRODUCT")" = 0
+          done
+          # Reinstall with the optional standalone application explicitly selected.
+          choices="$RUNNER_TEMP/$PRODUCT-enable-app.plist"
+          python3 - "$choices" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'wb') as stream:
+              plistlib.dump([{'choiceIdentifier': 'app', 'choiceAttribute': 'selected', 'attributeSetting': 1}], stream)
+          PY
+          /usr/sbin/installer -pkg "$package" -target / -showChoicesAfterApplyingChangesXML "$choices" > "$RUNNER_TEMP/$PRODUCT-optional-choices.plist"
+          python3 - "$RUNNER_TEMP/$PRODUCT-optional-choices.plist" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as stream:
+              entries = plistlib.load(stream)
+          assert any(item.get('choiceIdentifier') == 'app' and item.get('choiceAttribute') == 'selected'
+                     and item.get('attributeSetting') == 1 for item in entries), 'Optional app choice was not selected'
+          PY
+          sudo /usr/sbin/installer -pkg "$package" -target / -applyChoiceChangesXML "$choices" -verboseR -dumplog 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-install-optional.log"
+          test -x "$installed_app/Contents/MacOS/$PRODUCT"
+          pkgutil --pkg-info "$receipt_prefix.app"
+          cmp "$app/Contents/MacOS/$PRODUCT" "$installed_app/Contents/MacOS/$PRODUCT"
+          codesign --verify --strict --verbose=2 "$installed_app"
+          test "$(stat -f %u "$installed_app/Contents/MacOS/$PRODUCT")" = 0
+          test ! -e "$user_au"
+          python3 - "$PLUGIN_VERSION" "$receipt_prefix" "$installed_au" "$installed_vst3" "$installed_app" <<'PY'
+          import pathlib, plistlib, subprocess, sys
+          version, receipt_prefix = sys.argv[1:3]
+          for bundle in sys.argv[3:]:
+              with (pathlib.Path(bundle) / 'Contents/Info.plist').open('rb') as stream:
+                  info = plistlib.load(stream)
+              assert info['CFBundleShortVersionString'] == version, 'Installed bundle version mismatch: ' + bundle
+          for kind in ('au', 'vst3', 'app', 'docs'):
+              identifier = receipt_prefix + '.' + kind
+              receipt = plistlib.loads(subprocess.check_output(['pkgutil', '--pkg-info-plist', identifier]))
+              assert receipt['pkg-version'] == version, 'Installed receipt version mismatch: ' + identifier
+          print('All installed bundles and package receipts match source version ' + version)
+          PY
+          python3 "$RUNNER_TEMP/verify-breakwater-kit.py" Resources/Kit "$PLUGIN_VERSION" \
+            "$installed_au/Contents/Resources/Kit" \
+            "$installed_vst3/Contents/Resources/Kit" \
+            "$installed_app/Contents/Resources/Kit" | tee -a "$RUNNER_TEMP/$PRODUCT-kit-verification.log"
+          # The Audio Unit is now discovered from the system installation created by installer.
+          /usr/libexec/PlistBuddy -c 'Print :AudioComponents' "$installed_au/Contents/Info.plist" | tee "$RUNNER_TEMP/$PRODUCT-audio-components.log"
+          ls -ld "$installed_au" "$installed_au/Contents" "$installed_au/Contents/MacOS" "$installed_au/Contents/MacOS/$PRODUCT" | tee -a "$RUNNER_TEMP/$PRODUCT-audio-components.log"
+          sudo killall -9 AudioComponentRegistrar 2>/dev/null || true
+          python3 - aufx "$AU_CODE" "$AU_MANUFACTURER" "$RUNNER_TEMP/$PRODUCT-au-discovery.log" <<'PY'
+          import pathlib, subprocess, sys, time
+          expected = tuple(sys.argv[1:4])
+          log = pathlib.Path(sys.argv[4])
+          log.write_text('Waiting for registered Audio Unit: ' + ' '.join(expected) + '\n', encoding='utf-8')
+          deadline = time.monotonic() + 30.0
+          time.sleep(2.0)
+          attempt = 0
+          last_output = ''
+          while time.monotonic() < deadline:
+              attempt += 1
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  break
+              try:
+                  result = subprocess.run(['auval', '-a'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True, timeout=min(5.0, remaining), check=False)
+                  last_output = result.stdout
+                  status = result.returncode
+              except subprocess.TimeoutExpired as error:
+                  output = error.stdout or ''
+                  last_output = output.decode('utf-8', errors='replace') if isinstance(output, bytes) else output
+                  status = 'timed out'
+              with log.open('a', encoding='utf-8') as stream:
+                  stream.write('\nAttempt %d (%s)\n%s\n' % (attempt, status, last_output))
+              if status == 0 and any(tuple(line.split()[:3]) == expected for line in last_output.splitlines()):
+                  print('Registered Audio Unit: ' + ' '.join(expected))
+                  sys.exit(0)
+              time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+          print(last_output, file=sys.stderr)
+          print('Audio Unit registration failed within 30 seconds; see discovery and Info.plist logs.', file=sys.stderr)
+          sys.exit(1)
+          PY
+          auval -v aufx "$AU_CODE" "$AU_MANUFACTURER" 2>&1 | tee "$RUNNER_TEMP/$PRODUCT-auval.log"
+          hdiutil verify "${package%.pkg}.dmg"
+
+      - name: Include installation instructions and validation record
+        working-directory: sources/${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          cat > dist/INSTALL-FIRST.txt <<EOF
+          $PRODUCT $PLUGIN_VERSION - COMPILED INTEL MAC INSTALLER
+
+          1. Quit Logic Pro or GarageBand.
+          2. Double-click the .pkg file and follow Apple's Installer.
+             Alternatively, open the .dmg and double-click Install $PRODUCT.pkg.
+          3. Choose Audio Unit for Logic Pro / GarageBand and enter your normal
+             Mac administrator password when Apple's Installer requests it.
+          4. Reopen your DAW and find $PRODUCT in its Audio Units menu.
+
+          Breakwater is an audio effect: insert it on a copy of your guitar or
+          bass guide track. Use a constant-tempo 4/4 project with an aligned
+          first bar, capture or import the guide, then generate and preview drums.
+          This version does not automatically follow arbitrary meters or tempo maps.
+          The recorded starter kit has 24 WAV files: eight drum/cymbal pieces,
+          three velocity layers each, and one recording per layer.
+
+          No compilation, Terminal commands, CMake, or developer tools are needed
+          on the destination Mac. The source archive accompanies the installer
+          for the default GPLv3 code distribution; it is not needed to install.
+          The separate AVL Drumkits sample assets retain their CC-BY-SA 3.0
+          license and original music exception; included notices give details.
+
+          These installers are unsigned and not notarized. If Catalina blocks
+          opening a downloaded installer, its Security & Privacy preferences
+          may offer Open Anyway. Only approve a file you trust.
+
+          Build target: Intel x86_64, minimum macOS 10.15.
+          Runtime tests ran on GitHub's newer macOS 15 Intel runner.
+          Catalina 10.15.7 and your Logic/GarageBand version still need runtime
+          and listening validation; deployment metadata alone does not prove it.
+          EOF
+          {
+            echo "$PRODUCT native Mac build validation"
+            echo "Version: $PLUGIN_VERSION"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            sw_vers
+            echo "Passed: CTest, Mach-O architecture/deployment checks, native pkgbuild/productbuild,
+          legacy gzip payloads, default and optional-app installation, installed destinations/receipts,
+          installed bundle signatures and source-matched bundle/receipt versions,
+          all 24 kit WAVs and attribution files in each installed format and full source,
+          AU validation from the system-installed plugin,
+          DMG verification, and artifact checksums."
+            echo "Not tested: Catalina 10.15.7 runtime, Logic/GarageBand runtime, listening quality."
+            echo "Signing: ad-hoc code signatures; unsigned and unnotarized installer."
+          } > dist/BUILD-VALIDATION.txt
+
+      - name: Upload finished installers and corresponding source
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.product }}-macOS-Intel-Installer
+          path: |
+            sources/${{ matrix.product }}/dist/*.pkg
+            sources/${{ matrix.product }}/dist/*.dmg
+            sources/${{ matrix.product }}/dist/*.sha256
+            sources/${{ matrix.product }}/dist/*Corresponding-Source.tar.gz
+            sources/${{ matrix.product }}/dist/INSTALL-FIRST.txt
+            sources/${{ matrix.product }}/dist/BUILD-VALIDATION.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Preserve diagnostic logs if a check fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.product }}-failed-build-diagnostics
+          path: |
+            ${{ runner.temp }}/${{ matrix.product }}-build.log
+            ${{ runner.temp }}/${{ matrix.product }}-auval.log
+            ${{ runner.temp }}/${{ matrix.product }}-au-discovery.log
+            ${{ runner.temp }}/${{ matrix.product }}-audio-components.log
+            ${{ runner.temp }}/${{ matrix.product }}-kit-verification.log
+            ${{ runner.temp }}/${{ matrix.product }}-install-*.log
+            ${{ runner.temp }}/${{ matrix.product }}-*-choices.plist
+            sources/${{ matrix.product }}/build/macos-x86_64/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 1
